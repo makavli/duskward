@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# CI only: publish the current version as a GitHub release with the builds in out/ (once per version).
+set -euo pipefail
+v=$(python3 -c "import duskward; print(duskward.__version__)")
+[[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::unexpected version: $v"; exit 1; }
+tag="v$v"
+if gh release view "$tag" > /dev/null 2>&1; then
+    echo "::notice::$tag is already released"
+    exit 0
+fi
+{ echo; echo "### SHA-256"; echo; echo '```'; (cd out && sha256sum *); echo '```'; } >> notes.md
+gh release create "$tag" out/* --target "$GITHUB_SHA" --title "Duskward $v" --notes-file notes.md
