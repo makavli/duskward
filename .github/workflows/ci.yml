@@ -1,0 +1,191 @@
+name: CI
+
+# Pull request: tests, the autopilot flies every evening, the version is new, the Windows build (one Duskward.exe)
+# that starts and quits on its own, and the browser build played in headless Chrome. Merge to main: the same,
+# then a GitHub release of that version (notes = its CHANGELOG entry plus the builds' SHA-256). itch.io is separate and manual: see itch.yml.
+# Red checks open an issue (one per pull request, one for main); the next green run closes it.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}   # never cancel a release on main
+
+env:
+  SDL_VIDEODRIVER: dummy
+  SDL_AUDIODRIVER: dummy
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0               # the version check reads the tags
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+      - run: pip install -r requirements.txt
+      - name: Synthesise the sounds
+        run: python tools/make_sounds.py
+      - name: Unit tests
+        run: python -m unittest -v
+      - name: The autopilot flies every evening
+        run: python tools/sim.py all
+      - name: The version is new
+        if: github.event_name == 'pull_request' && github.event.pull_request.user.login != 'dependabot[bot]'   # its action bumps release nothing
+        run: python tools/version_check.py
+
+  # The Windows build runs on pull requests too (minutes are free on a public repo): a broken build shows up before
+  # the merge, not on main. macOS and Linux builds are not here (the hosted Mac runners kept a release waiting in
+  # the queue): they are made on demand by desktop.yml and added to a release afterwards.
+  build:
+    needs: test
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+      - run: pip install -r requirements.txt pyinstaller==6.22.3
+      - name: Synthesise the sounds
+        run: python tools/make_sounds.py
+      - name: Build
+        shell: bash
+        run: python -m PyInstaller --noconfirm --clean --windowed --onefile --name Duskward --add-data duskward/sounds:duskward/sounds --add-data duskward/fonts:duskward/fonts run.py   # one exe to double-click
+      - name: The build starts, plays 120 frames and quits
+        timeout-minutes: 3             # the game quits itself after DUSKWARD_FRAMES
+        shell: bash
+        env:
+          DUSKWARD_FRAMES: "120"
+        run: dist/Duskward.exe
+      - name: Pack
+        shell: bash
+        run: mkdir out && cp dist/Duskward.exe out/Duskward.exe
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: build-Windows
+          path: out/*
+          retention-days: 3
+
+  # The browser version (pygbag), played in headless Chrome: it must load, run and start a game without a traceback.
+  web:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+      - run: pip install -r requirements.txt pygbag==0.9.3 websocket-client==1.8.0
+      - name: Build
+        run: bash tools/web_build.sh
+      - name: Play it in Chrome
+        env:
+          SDL_VIDEODRIVER: ""                 # the page draws for real; only the runner's Python was headless
+        run: python tools/web_check.py 60 420      # a shared runner is slow: the bot's last evening gets seven minutes
+      - if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: web-check-shots
+          path: shots/
+          retention-days: 3
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: build-Web
+          path: out/Duskward-web.zip
+          retention-days: 3
+
+  # One name for the rule on main to require, whatever the jobs above hold.
+  passed:
+    if: always()
+    needs: [test, build, web]
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Every test and build job succeeded
+        env:
+          TEST: ${{ needs.test.result }}
+          BUILD: ${{ needs.build.result }}
+          WEB: ${{ needs.web.result }}
+        run: test "$TEST" = success && test "$BUILD" = success && test "$WEB" = success
+
+  release:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: passed
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: out
+          merge-multiple: true
+      - name: Release this version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: python3 tools/release_notes.py > notes.md && bash tools/release.sh
+
+  # The notice, not the gate (the gate is `passed`): red checks open an issue, linked from the pull request; the next
+  # green run closes it, and so does closing the pull request (close-issue.yml). A fork's token cannot write issues.
+  issue:
+    if: ${{ !cancelled() && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) }}
+    needs: [passed, release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Open, update or close the issue of this pull request or of main
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          PASSED: ${{ needs.passed.result }}
+          RELEASE: ${{ needs.release.result }}
+          RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          # The title holds only a number, so it is safe inside the jq string below.
+          if [ -n "$PR" ]; then title="Checks failed on pull request #$PR"; else title="Checks failed on main"; fi
+          issue="$(gh api "repos/$GH_REPO/issues?state=open&labels=ci-failure&per_page=100" --jq ".[] | select(.pull_request == null and .title == \"$title\") | .number" | head -n 1)"
+          if [ "$PASSED" = success ] && [ "$RELEASE" != failure ]; then
+            if [ -n "$issue" ]; then gh issue close "$issue" --comment "Fixed: the checks on ${SHA:0:7} are green. $RUN"; fi
+            exit 0
+          fi
+          if [ -n "$issue" ]; then
+            gh issue comment "$issue" --body "Still red on ${SHA:0:7}: $RUN"
+            exit 0
+          fi
+          # A pull request closed while this run went on gets no issue: close-issue.yml has already run for it.
+          if [ -n "$PR" ] && [ "$(gh pr view "$PR" --json state --jq .state)" != "OPEN" ]; then exit 0; fi
+          gh label create ci-failure --force --color B60205 --description "The checks of a pull request or of main are red"
+          if [ -z "$PR" ]; then
+            gh issue create --title "$title" --label ci-failure --body "The checks or the release on main failed on ${SHA:0:7}: $RUN
+
+          The next green run on main closes this issue."
+            exit 0
+          fi
+          url="$(gh issue create --title "$title" --label ci-failure --body "The checks of #$PR failed on ${SHA:0:7}: $RUN
+
+          #$PR cannot merge until its checks are green. The next green run closes this issue.")"
+          gh pr comment "$PR" --body "Blocked by #${url##*/}: the checks are red. $RUN"

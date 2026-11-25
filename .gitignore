@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.venv/
+build/
+dist/
+*.spec
+shots/
+out/
+*.log
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+notes.md
+duskward/sounds/
